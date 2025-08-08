@@ -15,7 +15,7 @@ startBtn.addEventListener("click", async () => {
   clearUI();
   readerEl.style.display = "block";
   readerEl.style.minHeight = "260px";
-  statusEl.textContent = "กำลังเปิดกล้อง...";
+  setStatus("กำลังเปิดกล้อง...");
 
   try {
     if (!html5QrCode) html5QrCode = new Html5Qrcode("reader");
@@ -24,29 +24,38 @@ startBtn.addEventListener("click", async () => {
       { facingMode: "environment" },
       { fps: 10, qrbox: 260 },
       async (qrText) => {
-        // Show raw for debug if you want
+        await stopScanner();
+
+        // 1) show raw QR (debug)
         resultEl.style.display = "block";
         resultEl.textContent = "QR Data: " + qrText;
 
-        await stopScanner();
-
+        // 2) extract 6-digit ticket
         const ticketNumber = extractSixDigitNumber(qrText);
         if (!ticketNumber) {
           setStatus("อ่านเลขสลากไม่สำเร็จ กรุณาลองใหม่");
           return;
         }
+        setStatus("เลขสลากที่อ่านได้: " + ticketNumber);
 
+        // 3) fetch results
         setStatus("กำลังดึงผลรางวัลงวดล่าสุด...");
-        const data = await fetchLatestResults();
+        let data;
+        try {
+          data = await fetchLatestResultsWithFallbacks();
+        } catch (e) {
+          setStatus("ดึงผลรางวัลไม่สำเร็จ: " + (e?.message || e));
+          return;
+        }
         if (!data) {
-          setStatus("ดึงผลรางวัลไม่สำเร็จ ลองใหม่อีกครั้ง");
+          setStatus("ดึงผลรางวัลไม่สำเร็จ (API ทั้งหมดล้มเหลว)");
           return;
         }
 
-        // Compute prize
+        // 4) compute prize
         const result = determinePrize(ticketNumber, data.prizes);
         showResult(ticketNumber, data.date, result);
-        setStatus("");
+        setStatus(""); // clear status
       },
       () => {}
     );
@@ -75,60 +84,71 @@ function clearUI() {
   prizeTextEl.textContent = "-";
   ticketNoEl.textContent = "-";
   drawDateEl.textContent = "-";
+  prizeTextEl.style.color = "";
   cardEl.style.display = "none";
 }
 
-/** Try to pull 6 consecutive digits from the QR payload */
+/** Pull 6 consecutive digits (Thai lottery ticket number) */
 function extractSixDigitNumber(qrText) {
-  // Many Thai lottery QR formats contain groups; we just need the 6-digit ticket number.
-  const m = qrText.match(/(\d{6})/);
+  const m = String(qrText).match(/(\d{6})(?!\d)/); // last 6-digit block
   return m ? m[1] : null;
 }
 
-/** Fetch latest draw JSON (community API). Swap endpoint if needed. */
-async function fetchLatestResults() {
+/** Try multiple endpoints, with visible error messages */
+async function fetchLatestResultsWithFallbacks() {
+  // Primary
   const endpoints = [
-    // Primary (community)
-    "https://lotto.api.rayriffy.com/latest",
-    // Add backups here if you have any others:
-    // "https://thai-lottery-api.vercel.app/api/latest"
+    { name: "rayriffy", url: "https://lotto.api.rayriffy.com/latest", viaProxy: false },
+    // Mirror via GitHub raw (CORS OK through a proxy)
+    { name: "gh-raw", url: "https://raw.githubusercontent.com/rayriffy/thai-lotto-results/master/latest.json", viaProxy: true },
+    // Generic proxy for anything else
+    { name: "allorigins", url: "https://lotto.api.rayriffy.com/latest", viaProxy: "allorigins" },
   ];
 
-  for (const url of endpoints) {
+  for (const ep of endpoints) {
     try {
-      const res = await fetch(url, { cache: "no-store" });
-      if (!res.ok) continue;
-      const json = await res.json();
+      let res;
+      if (ep.viaProxy === true) {
+        // Cloudflare-hosted pass-through (public mirror)
+        const proxied = "https://r.jina.ai/http/" + ep.url.replace(/^https?:\/\//, "");
+        res = await fetch(proxied, { cache: "no-store" });
+      } else if (ep.viaProxy === "allorigins") {
+        const proxied = "https://api.allorigins.win/raw?url=" + encodeURIComponent(ep.url);
+        res = await fetch(proxied, { cache: "no-store" });
+      } else {
+        res = await fetch(ep.url, { cache: "no-store", mode: "cors" });
+      }
 
-      // Normalize possible shapes into { date, prizes: {...} }
-      const payload = normalizeResults(json);
-      if (payload?.date && payload?.prizes) return payload;
+      if (!res.ok) {
+        setStatus(`API ${ep.name} ตอบกลับ ${res.status}`);
+        continue;
+      }
+
+      const text = await res.text();
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        // Some proxies return text that is still JSON-like
+        json = JSON.parse(text.replace(/^\uFEFF/, "")); // strip BOM if any
+      }
+      const normalized = normalizeResults(json);
+      if (normalized?.date && normalized?.prizes) {
+        return normalized;
+      } else {
+        setStatus(`API ${ep.name} รูปแบบข้อมูลไม่ตรง (ปรับ normalizer ได้)`);
+      }
     } catch (e) {
-      // try next endpoint
+      setStatus(`API ${ep.name} ล้มเหลว: ${e?.message || e}`);
+      continue;
     }
   }
   return null;
 }
 
-/** Accepts various API shapes and returns a normalized structure */
+/** Normalize various API payload shapes */
 function normalizeResults(json) {
-  // Expected Rayriffy-ish shape
-  // {
-  //   response: {
-  //     date: "YYYY-MM-DD",
-  //     prizes: {
-  //       first: "123456",
-  //       nearbyFirst: ["123455","123457"],
-  //       second: [..5 numbers..],
-  //       third: [...],
-  //       fourth: [...],
-  //       fifth: [...],
-  //       frontThree: ["123","456"],
-  //       backThree: ["123","456"],
-  //       lastTwo: "12"
-  //     }
-  //   }
-  // }
+  // Expected rayriffy-style
   const r = json?.response || json;
   if (!r) return null;
 
@@ -136,23 +156,24 @@ function normalizeResults(json) {
   const p = r.prizes || r.result || r;
   if (!p) return null;
 
+  const toArray = (v) => (Array.isArray(v) ? v : v ? [v] : []);
   return {
     date,
     prizes: {
       first: p.first || p.prize1,
       nearbyFirst: p.nearbyFirst || p.adjacentFirst || p.adjacent || [],
-      second: p.second || p.prize2 || [],
-      third: p.third || p.prize3 || [],
-      fourth: p.fourth || p.prize4 || [],
-      fifth: p.fifth || p.prize5 || [],
-      frontThree: p.frontThree || p.firstThree || p.front3 || [],
-      backThree: p.backThree || p.lastThree || p.back3 || [],
+      second: toArray(p.second || p.prize2),
+      third: toArray(p.third || p.prize3),
+      fourth: toArray(p.fourth || p.prize4),
+      fifth: toArray(p.fifth || p.prize5),
+      frontThree: toArray(p.frontThree || p.firstThree || p.front3),
+      backThree: toArray(p.backThree || p.lastThree || p.back3),
       lastTwo: p.lastTwo || p.last2 || p.two || p["2digits"]
     }
   };
 }
 
-/** Determine prize label for a 6-digit ticket number */
+/** Prize logic */
 function determinePrize(ticket, prizes) {
   const t = String(ticket);
 
@@ -163,11 +184,8 @@ function determinePrize(ticket, prizes) {
   if (arrHas(prizes.fourth, t)) return "🎉 รางวัลที่ 4";
   if (arrHas(prizes.fifth, t)) return "🎉 รางวัลที่ 5";
 
-  // front 3 and back 3
   if (prefixInSet(t, prizes.frontThree)) return "✅ เลขหน้า 3 ตัว";
   if (suffixInSet(t, prizes.backThree)) return "✅ เลขท้าย 3 ตัว";
-
-  // last two digits
   if (suffixMatch(t, prizes.lastTwo)) return "✅ เลขท้าย 2 ตัว";
 
   return "เสียใจ ไม่ถูกรางวัล";
@@ -204,3 +222,28 @@ function showResult(ticket, date, prizeText) {
   prizeTextEl.style.color = prizeText.includes("🎉") || prizeText.includes("✅") ? "green" : "crimson";
   cardEl.style.display = "block";
 }
+
+/* ---- Optional: paste QR for testing without camera ---- */
+(function addPasteTester() {
+  const tester = document.createElement("div");
+  tester.style.maxWidth = "500px";
+  tester.style.margin = "12px auto";
+  tester.innerHTML = `
+    <input id="qrInput" placeholder="วางสตริง QR ที่นี่" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;">
+    <button id="testBtn" style="margin-top:8px;background:#007BFF;color:#fff;padding:10px 14px;border:none;border-radius:8px;">ทดสอบผลรางวัลด้วยสตริงนี้</button>
+  `;
+  document.querySelector(".container").appendChild(tester);
+  document.getElementById("testBtn").addEventListener("click", async () => {
+    clearUI();
+    const text = document.getElementById("qrInput").value || "";
+    const ticketNumber = extractSixDigitNumber(text);
+    if (!ticketNumber) return setStatus("สตริงนี้ไม่มีเลข 6 หลักท้าย");
+    setStatus("เลขสลากที่อ่านได้: " + ticketNumber);
+    setStatus("กำลังดึงผลรางวัลงวดล่าสุด...");
+    const data = await fetchLatestResultsWithFallbacks();
+    if (!data) return setStatus("ดึงผลรางวัลไม่สำเร็จ");
+    const result = determinePrize(ticketNumber, data.prizes);
+    showResult(ticketNumber, data.date, result);
+    setStatus("");
+  });
+})();
