@@ -90,8 +90,25 @@ function clearUI() {
 
 /** Pull 6 consecutive digits (Thai lottery ticket number) */
 function extractSixDigitNumber(qrText) {
-  const m = String(qrText).match(/(\d{6})(?!\d)/); // last 6-digit block
-  return m ? m[1] : null;
+  const s = String(qrText).trim();
+
+  // 1) Exact hyphen pattern: aa-bb-cc-dddddd-eeee
+  const m = s.match(/^(\d{2})-(\d{2})-(\d{2})-(\d{6})-(\d{4})$/);
+  if (m) return m[4];
+
+  // 2) Generic hyphen split: pick the 4th chunk if it's 6 digits
+  const parts = s.split("-");
+  if (parts.length >= 4 && /^\d{6}$/.test(parts[3])) {
+    return parts[3];
+  }
+
+  // 3) Fallback: choose the 6‑digit group that is NOT followed by 4 digits
+  // (avoids grabbing the final "eeee")
+  const groups = s.match(/\d{6}/g) || [];
+  if (groups.length >= 2) return groups[groups.length - 2]; // second last 6‑digit group
+  if (groups.length === 1) return groups[0];
+
+  return null;
 }
 
 /** Try multiple endpoints, with visible error messages */
