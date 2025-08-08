@@ -1,16 +1,25 @@
+// ---------- DOM refs ----------
 const startBtn = document.getElementById("start-scan");
 const readerEl = document.getElementById("reader");
-const resultEl = document.getElementById("result");
-const statusEl = document.getElementById("status");
+const resultEl = document.getElementById("result");        // raw QR (debug)
+const statusEl = document.getElementById("status");        // small status line
 
-// Result card elements
+// Result card (must exist in index.html)
 const cardEl = document.getElementById("resultCard");
 const ticketNoEl = document.getElementById("ticketNo");
 const drawDateEl = document.getElementById("drawDate");
 const prizeTextEl = document.getElementById("prizeText");
 
-let html5QrCode;
+// Date picker (created on the fly if not present)
+let datePicker = document.getElementById("datePicker");
+let drawDateInput = document.getElementById("drawDateInput");
+let checkByDateBtn = document.getElementById("checkByDateBtn");
+ensureDatePicker();
 
+// QR instance
+let html5QrCode = null;
+
+// ---------- UI wiring ----------
 startBtn.addEventListener("click", async () => {
   clearUI();
   readerEl.style.display = "block";
@@ -26,11 +35,11 @@ startBtn.addEventListener("click", async () => {
       async (qrText) => {
         await stopScanner();
 
-        // 1) show raw QR (debug)
+        // Show raw QR for debugging
         resultEl.style.display = "block";
         resultEl.textContent = "QR Data: " + qrText;
 
-        // 2) extract 6-digit ticket
+        // 1) Extract ticket number (6 digits)
         const ticketNumber = extractSixDigitNumber(qrText);
         if (!ticketNumber) {
           setStatus("อ่านเลขสลากไม่สำเร็จ กรุณาลองใหม่");
@@ -38,26 +47,37 @@ startBtn.addEventListener("click", async () => {
         }
         setStatus("เลขสลากที่อ่านได้: " + ticketNumber);
 
-        // 3) fetch results
-        setStatus("กำลังดึงผลรางวัลงวดล่าสุด...");
-        let data;
-        try {
-          data = await fetchLatestResultsWithFallbacks();
-        } catch (e) {
-          setStatus("ดึงผลรางวัลไม่สำเร็จ: " + (e?.message || e));
-          return;
-        }
-        if (!data) {
-          setStatus("ดึงผลรางวัลไม่สำเร็จ (API ทั้งหมดล้มเหลว)");
-          return;
+        // 2) Try to auto-detect draw date from QR
+        let isoDate = extractDrawDate(qrText);
+        if (isoDate) {
+          setStatus(`พบบ่งชี้งวด: ${isoDate} กำลังดึงผล...`);
+          const data = await fetchResultsByDate(isoDate);
+          if (data) {
+            const result = determinePrize(ticketNumber, data.prizes);
+            showResult(ticketNumber, data.date, result);
+            setStatus("");
+            return;
+          } else {
+            setStatus("ดึงผลตามวันที่จาก QR ไม่สำเร็จ");
+          }
         }
 
-        // 4) compute prize
-        const result = determinePrize(ticketNumber, data.prizes);
-        showResult(ticketNumber, data.date, result);
-        setStatus(""); // clear status
+        // 3) Fallback: manual date picker
+        datePicker.style.display = "block";
+        drawDateInput.value = guessRecentDrawIso();
+        setStatus("กำหนด 'งวดวันที่' แล้วกด 'ตรวจผลตามวันที่นี้'");
+        checkByDateBtn.onclick = async () => {
+          const chosen = drawDateInput.value;
+          if (!chosen) return setStatus("กรุณาเลือกวันที่งวด");
+          setStatus(`กำลังดึงผลงวด ${chosen}...`);
+          const data = await fetchResultsByDate(chosen);
+          if (!data) return setStatus("ไม่พบผลรางวัลงวดนี้");
+          const result = determinePrize(ticketNumber, data.prizes);
+          showResult(ticketNumber, data.date, result);
+          setStatus("");
+        };
       },
-      () => {}
+      () => {} // decode failures ignored
     );
   } catch (e) {
     console.error(e);
@@ -65,6 +85,7 @@ startBtn.addEventListener("click", async () => {
   }
 });
 
+// ---------- UI helpers ----------
 function setStatus(msg) {
   statusEl.textContent = msg || "";
 }
@@ -86,54 +107,127 @@ function clearUI() {
   drawDateEl.textContent = "-";
   prizeTextEl.style.color = "";
   cardEl.style.display = "none";
+  if (datePicker) datePicker.style.display = "none";
 }
 
-/** Pull 6 consecutive digits (Thai lottery ticket number) */
+function ensureDatePicker() {
+  if (!datePicker) {
+    const wrapper = document.createElement("div");
+    wrapper.id = "datePicker";
+    wrapper.style.display = "none";
+    wrapper.style.maxWidth = "500px";
+    wrapper.style.margin = "12px auto";
+    wrapper.innerHTML = `
+      <label for="drawDateInput" style="display:block; margin-bottom:6px;">
+        เลือกงวดวันที่ (ถ้าระบุอัตโนมัติไม่สำเร็จ)
+      </label>
+      <input id="drawDateInput" type="date" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:8px;">
+      <button id="checkByDateBtn" style="margin-top:8px; background:#007BFF; color:#fff; padding:10px 14px; border:none; border-radius:8px;">
+        ตรวจผลตามวันที่นี้
+      </button>
+    `;
+    document.querySelector(".container")?.appendChild(wrapper);
+    datePicker = wrapper;
+    drawDateInput = document.getElementById("drawDateInput");
+    checkByDateBtn = document.getElementById("checkByDateBtn");
+  }
+}
+
+// ---------- Parsing ----------
+/**
+ * Thai lottery QR is commonly: aa-bb-cc-dddddd-eeee
+ * where the 4th chunk (dddddd) is the 6-digit ticket number.
+ * We grab that first. Fallbacks handle slightly different shapes.
+ */
 function extractSixDigitNumber(qrText) {
   const s = String(qrText).trim();
 
-  // 1) Exact hyphen pattern: aa-bb-cc-dddddd-eeee
+  // Exact pattern
   const m = s.match(/^(\d{2})-(\d{2})-(\d{2})-(\d{6})-(\d{4})$/);
   if (m) return m[4];
 
-  // 2) Generic hyphen split: pick the 4th chunk if it's 6 digits
+  // Generic hyphen split: the 4th chunk if 6 digits
   const parts = s.split("-");
-  if (parts.length >= 4 && /^\d{6}$/.test(parts[3])) {
-    return parts[3];
-  }
+  if (parts.length >= 4 && /^\d{6}$/.test(parts[3])) return parts[3];
 
-  // 3) Fallback: choose the 6‑digit group that is NOT followed by 4 digits
-  // (avoids grabbing the final "eeee")
+  // Fallback: choose the 6‑digit group that is NOT the final 4-digit group
   const groups = s.match(/\d{6}/g) || [];
-  if (groups.length >= 2) return groups[groups.length - 2]; // second last 6‑digit group
+  if (groups.length >= 2) return groups[groups.length - 2]; // second last 6-digit group
   if (groups.length === 1) return groups[0];
 
   return null;
 }
 
-/** Try multiple endpoints, with visible error messages */
-async function fetchLatestResultsWithFallbacks() {
-  // Primary
+/**
+ * Try to derive draw date (YYYY-MM-DD) from aa-bb-cc groups.
+ * We test a few permutations and keep only plausible Thai draw days (1,2,3,16,17).
+ * Once you share sample QR strings + known draw dates, we can lock the exact mapping.
+ */
+function extractDrawDate(qrText) {
+  const s = String(qrText).trim();
+  const m = s.match(/^(\d{2})-(\d{2})-(\d{2})-(\d{6})-(\d{4})$/);
+  if (!m) return null;
+
+  const [, g1, g2, g3] = m;
+
+  // Candidates: yy-mm-dd, dd-mm-yy, yy-dd-mm
+  const candidates = [
+    yyMmDdToIso(g1, g2, g3),
+    yyMmDdToIso(g3, g2, g1),
+    yyMmDdToIso(g1, g3, g2),
+  ].filter(Boolean);
+
+  // Keep plausible Thai draw days
+  const plausible = candidates.find(d => isPlausibleThaiDrawDate(d));
+  return plausible || null;
+}
+
+// Convert 2-digit year/month/day to ISO (assume 20YY; adjust if we find BE later)
+function yyMmDdToIso(yy, mm, dd) {
+  const y = Number(yy), m = Number(mm), d = Number(dd);
+  if (!(y>=0 && y<=99 && m>=1 && m<=12 && d>=1 && d<=31)) return null;
+  const year = 2000 + y;
+  const iso = `${year}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  return Number.isNaN(Date.parse(iso)) ? null : iso;
+}
+
+function isPlausibleThaiDrawDate(iso) {
+  const d = new Date(iso + "T00:00:00Z");
+  const day = d.getUTCDate();
+  // Main draws 1 & 16; sometimes shifted to 2,3,17 due to holidays
+  return [1,2,3,16,17].includes(day);
+}
+
+// Suggest recent draw (for the manual picker)
+function guessRecentDrawIso() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth(); // 0..11
+  const day = now.getDate();
+  // If past 16th, suggest 16; otherwise 1st (UTC to avoid TZ drift)
+  const pick = (day >= 16) ? 16 : 1;
+  const d = new Date(Date.UTC(y, m, pick));
+  return d.toISOString().slice(0,10);
+}
+
+// ---------- Fetch results ----------
+async function fetchResultsByDate(isoDate) {
+  // Try multiple sources; normalize afterward
   const endpoints = [
-    { name: "rayriffy", url: "https://lotto.api.rayriffy.com/latest", viaProxy: false },
-    // Mirror via GitHub raw (CORS OK through a proxy)
-    { name: "gh-raw", url: "https://raw.githubusercontent.com/rayriffy/thai-lotto-results/master/latest.json", viaProxy: true },
-    // Generic proxy for anything else
-    { name: "allorigins", url: "https://lotto.api.rayriffy.com/latest", viaProxy: "allorigins" },
+    { name: "rayriffy", url: `https://lotto.api.rayriffy.com/draw/${isoDate}`, kind: "json" },
+    { name: "gh-raw",   url: `https://raw.githubusercontent.com/rayriffy/thai-lotto-results/master/${isoDate}.json`, kind: "proxy" },
+    { name: "fallback", url: `https://api.allorigins.win/raw?url=${encodeURIComponent('https://lotto.api.rayriffy.com/draw/' + isoDate)}`, kind: "raw" },
   ];
 
   for (const ep of endpoints) {
     try {
       let res;
-      if (ep.viaProxy === true) {
-        // Cloudflare-hosted pass-through (public mirror)
+      if (ep.kind === "proxy") {
+        // Simple CORS passthrough
         const proxied = "https://r.jina.ai/http/" + ep.url.replace(/^https?:\/\//, "");
         res = await fetch(proxied, { cache: "no-store" });
-      } else if (ep.viaProxy === "allorigins") {
-        const proxied = "https://api.allorigins.win/raw?url=" + encodeURIComponent(ep.url);
-        res = await fetch(proxied, { cache: "no-store" });
       } else {
-        res = await fetch(ep.url, { cache: "no-store", mode: "cors" });
+        res = await fetch(ep.url, { cache: "no-store" });
       }
 
       if (!res.ok) {
@@ -143,18 +237,13 @@ async function fetchLatestResultsWithFallbacks() {
 
       const text = await res.text();
       let json;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        // Some proxies return text that is still JSON-like
-        json = JSON.parse(text.replace(/^\uFEFF/, "")); // strip BOM if any
-      }
+      try { json = JSON.parse(text); }
+      catch { json = JSON.parse(text.replace(/^\uFEFF/, "")); } // strip BOM if any
+
       const normalized = normalizeResults(json);
-      if (normalized?.date && normalized?.prizes) {
-        return normalized;
-      } else {
-        setStatus(`API ${ep.name} รูปแบบข้อมูลไม่ตรง (ปรับ normalizer ได้)`);
-      }
+      if (normalized?.date && normalized?.prizes) return normalized;
+
+      setStatus(`API ${ep.name} รูปแบบข้อมูลไม่ตรง`);
     } catch (e) {
       setStatus(`API ${ep.name} ล้มเหลว: ${e?.message || e}`);
       continue;
@@ -163,9 +252,8 @@ async function fetchLatestResultsWithFallbacks() {
   return null;
 }
 
-/** Normalize various API payload shapes */
+// Rayriffy-style normalization (with a few aliases)
 function normalizeResults(json) {
-  // Expected rayriffy-style
   const r = json?.response || json;
   if (!r) return null;
 
@@ -174,6 +262,7 @@ function normalizeResults(json) {
   if (!p) return null;
 
   const toArray = (v) => (Array.isArray(v) ? v : v ? [v] : []);
+
   return {
     date,
     prizes: {
@@ -190,7 +279,7 @@ function normalizeResults(json) {
   };
 }
 
-/** Prize logic */
+// ---------- Prize logic ----------
 function determinePrize(ticket, prizes) {
   const t = String(ticket);
 
@@ -232,6 +321,55 @@ function suffixMatch(ticket, two) {
   return String(two).trim() === last2;
 }
 
+// ---------- Optional: paste QR to test without camera ----------
+;(function addPasteTester() {
+  const tester = document.createElement("div");
+  tester.style.maxWidth = "500px";
+  tester.style.margin = "12px auto";
+  tester.innerHTML = `
+    <input id="qrInput" placeholder="วางสตริง QR ที่นี่ (สำหรับทดสอบ)" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;">
+    <button id="testBtn" style="margin-top:8px;background:#007BFF;color:#fff;padding:10px 14px;border:none;border-radius:8px;">ทดสอบผลรางวัลจากสตริงนี้</button>
+  `;
+  document.querySelector(".container")?.appendChild(tester);
+  document.getElementById("testBtn").addEventListener("click", async () => {
+    clearUI();
+    const text = document.getElementById("qrInput").value || "";
+    resultEl.style.display = "block";
+    resultEl.textContent = "QR Data: " + text;
+
+    const ticketNumber = extractSixDigitNumber(text);
+    if (!ticketNumber) return setStatus("สตริงนี้ไม่มีเลข 6 หลักตามรูปแบบสลาก");
+    setStatus("เลขสลากที่อ่านได้: " + ticketNumber);
+
+    // Try auto date, then manual
+    let isoDate = extractDrawDate(text);
+    if (isoDate) {
+      setStatus(`พบบ่งชี้งวด: ${isoDate} กำลังดึงผล...`);
+      const data = await fetchResultsByDate(isoDate);
+      if (data) {
+        const result = determinePrize(ticketNumber, data.prizes);
+        showResult(ticketNumber, data.date, result);
+        setStatus("");
+        return;
+      }
+    }
+    datePicker.style.display = "block";
+    drawDateInput.value = guessRecentDrawIso();
+    setStatus("ระบุวันที่งวด แล้วกดตรวจผล");
+    checkByDateBtn.onclick = async () => {
+      const chosen = drawDateInput.value;
+      if (!chosen) return setStatus("กรุณาเลือกวันที่งวด");
+      setStatus(`กำลังดึงผลงวด ${chosen}...`);
+      const data = await fetchResultsByDate(chosen);
+      if (!data) return setStatus("ไม่พบผลรางวัลงวดนี้");
+      const result = determinePrize(ticketNumber, data.prizes);
+      showResult(ticketNumber, data.date, result);
+      setStatus("");
+    };
+  });
+})();
+
+// ---------- Show result on card ----------
 function showResult(ticket, date, prizeText) {
   ticketNoEl.textContent = ticket;
   drawDateEl.textContent = date || "-";
@@ -239,28 +377,3 @@ function showResult(ticket, date, prizeText) {
   prizeTextEl.style.color = prizeText.includes("🎉") || prizeText.includes("✅") ? "green" : "crimson";
   cardEl.style.display = "block";
 }
-
-/* ---- Optional: paste QR for testing without camera ---- */
-(function addPasteTester() {
-  const tester = document.createElement("div");
-  tester.style.maxWidth = "500px";
-  tester.style.margin = "12px auto";
-  tester.innerHTML = `
-    <input id="qrInput" placeholder="วางสตริง QR ที่นี่" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;">
-    <button id="testBtn" style="margin-top:8px;background:#007BFF;color:#fff;padding:10px 14px;border:none;border-radius:8px;">ทดสอบผลรางวัลด้วยสตริงนี้</button>
-  `;
-  document.querySelector(".container").appendChild(tester);
-  document.getElementById("testBtn").addEventListener("click", async () => {
-    clearUI();
-    const text = document.getElementById("qrInput").value || "";
-    const ticketNumber = extractSixDigitNumber(text);
-    if (!ticketNumber) return setStatus("สตริงนี้ไม่มีเลข 6 หลักท้าย");
-    setStatus("เลขสลากที่อ่านได้: " + ticketNumber);
-    setStatus("กำลังดึงผลรางวัลงวดล่าสุด...");
-    const data = await fetchLatestResultsWithFallbacks();
-    if (!data) return setStatus("ดึงผลรางวัลไม่สำเร็จ");
-    const result = determinePrize(ticketNumber, data.prizes);
-    showResult(ticketNumber, data.date, result);
-    setStatus("");
-  });
-})();
