@@ -9,13 +9,24 @@
     <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
 </head>
 <body>
-    <div class="container">
-        <h1>📷 สแกนคิวอาร์สลากกินแบ่ง</h1>
-        <button id="start-scan">เริ่มสแกน</button>
-        <div id="reader" style="width: 300px; margin:auto; display:none;"></div>
-        <p id="result"></p>
+  <div class="container">
+    <h1>📷 สแกนคิวอาร์สลากกินแบ่ง</h1>
+    <button id="start-scan">เริ่มสแกน</button>
+
+    <div id="reader" style="width: 320px; margin:16px auto; display:none;"></div>
+
+    <div id="status" aria-live="polite"></div>
+
+    <div id="resultCard" class="card" style="display:none;">
+      <h2 id="prizeTitle">ผลการตรวจ</h2>
+      <div class="row"><span>เลขสลาก:</span><strong id="ticketNo">-</strong></div>
+      <div class="row"><span>งวดวันที่:</span><strong id="drawDate">-</strong></div>
+      <div class="row"><span>ผลลัพธ์:</span><strong id="prizeText">-</strong></div>
     </div>
-    
-    <script src="app.js"></script>
+
+    <p id="result" style="display:none;"></p> <!-- raw QR (debug) -->
+  </div>
+
+  <script src="app.js"></script>
 </body>
 </html>
